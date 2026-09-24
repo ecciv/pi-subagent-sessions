@@ -1,0 +1,69 @@
+export type UsageTotals = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	total: number;
+	cost: number;
+};
+
+/**
+ * Normalize session collections across pi runtime adapters. Current runtimes
+ * normally return arrays, while some adapters expose `{ entries: [...] }`.
+ */
+export function entryArray(value: unknown): any[] {
+	if (Array.isArray(value)) return value;
+	if (value && typeof value === "object") {
+		const iterable = value as Iterable<unknown>;
+		if (typeof iterable[Symbol.iterator] === "function") return Array.from(iterable);
+		const nested = (value as { entries?: unknown }).entries;
+		if (Array.isArray(nested)) return nested;
+		if (nested && typeof (nested as Iterable<unknown>)[Symbol.iterator] === "function") {
+			return Array.from(nested as Iterable<unknown>);
+		}
+	}
+	return [];
+}
+
+export function sessionEntries(session: { sessionManager?: { getEntries?: () => unknown }; messages?: unknown }): any[] {
+	const entries = session.sessionManager?.getEntries?.();
+	return entryArray(entries ?? session.messages);
+}
+
+export const SUBAGENT_OWNER_CUSTOM_TYPE = "subagent-owner";
+
+export function parentSessionIdFromEntries(entries: unknown): string | undefined {
+    for (const entry of entryArray(entries).reverse()) {
+        if (entry?.type !== "custom" || entry.customType !== SUBAGENT_OWNER_CUSTOM_TYPE) continue;
+        const parentSessionId = entry.data?.parentSessionId;
+        if (typeof parentSessionId === "string" && parentSessionId.length > 0) return parentSessionId;
+    }
+    return undefined;
+}
+
+export function emptyUsage(): UsageTotals {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+}
+
+export function addUsage(target: UsageTotals, usage: any): void {
+	if (!usage) return;
+	target.input += Number(usage.input ?? 0);
+	target.output += Number(usage.output ?? 0);
+	target.cacheRead += Number(usage.cacheRead ?? 0);
+	target.cacheWrite += Number(usage.cacheWrite ?? 0);
+	target.total += Number(usage.totalTokens ?? usage.total ?? 0);
+	target.cost += Number(usage.cost?.total ?? 0);
+}
+
+export function usageFromEntries(entries: unknown): UsageTotals {
+	const usage = emptyUsage();
+	for (const entry of entryArray(entries)) {
+		if ((entry?.type === "compaction" || entry?.type === "branch_summary") && entry.usage) {
+			addUsage(usage, entry.usage);
+			continue;
+		}
+		const message = entry?.type === "message" ? entry.message : entry;
+		if (message?.role === "assistant" || message?.role === "toolResult") addUsage(usage, message.usage);
+	}
+	return usage;
+}

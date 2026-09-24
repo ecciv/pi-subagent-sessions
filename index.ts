@@ -26,11 +26,24 @@ import {
 	type SelectItem,
 } from "@earendil-works/pi-tui";
 
+import {
+    addUsage,
+    emptyUsage,
+    entryArray,
+    parentSessionIdFromEntries,
+    sessionEntries,
+    SUBAGENT_OWNER_CUSTOM_TYPE,
+    usageFromEntries,
+    type UsageTotals,
+} from "./session-data.ts";
+import { subagentToolResult } from "./tool-result.ts";
+import { resolveModelReference } from "./model-resolution.ts";
+import { ReportGate } from "./report-gate.ts";
 const EXTENSION_PATH = fileURLToPath(import.meta.url);
 const EXTENSION_NAME = "subagent";
 const MAX_REPORT_TEXT = 12_000;
 const DEFAULT_CONFIG: SubagentConfig = {
-	maxActive: 6,
+	maxActive: 10,
 	progressTimeoutMs: 60_000,
 	progressTokenThreshold: 30_000,
 	progressRequestCooldownMs: 300_000,
@@ -49,15 +62,6 @@ Work only on the task assigned by the coordinator. Be concise. At the end of eac
 type AgentStatus = "running" | "done" | "stopped" | "error";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-type UsageTotals = {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	total: number;
-	cost: number;
-};
-
 type SubagentConfig = {
 	maxActive: number;
 	progressTimeoutMs: number;
@@ -70,36 +74,39 @@ type SubagentConfig = {
 };
 
 type SubagentRecord = {
-	id: string;
-	shortId: string;
-	name: string;
-	task?: string;
-	instructionCount: number;
-	cwd: string;
-	session: AgentSession;
-	sessionFile: string;
-	model?: Model<any>;
-	thinkingLevel: ThinkingLevel;
-	status: AgentStatus;
-	createdAt: number;
-	startedAt?: number;
-	lastTurnStartedAt?: number;
-	turnStartingTokens?: number;
-	lastWatchdogAt?: number;
-	lastReportAt?: number;
-	watchdogTimer?: ReturnType<typeof setInterval>;
-	lastError?: string;
-	lastReport?: string;
-	unsubscribe: () => void;
+    id: string;
+    shortId: string;
+    name: string;
+    task?: string;
+    instructionCount: number;
+    cwd: string;
+    parentSessionId: string;
+    session: AgentSession;
+    sessionFile: string;
+    model?: Model<any>;
+    thinkingLevel: ThinkingLevel;
+    status: AgentStatus;
+    createdAt: number;
+    startedAt?: number;
+    lastTurnStartedAt?: number;
+    turnStartingTokens?: number;
+    lastWatchdogAt?: number;
+    lastReportAt?: number;
+    watchdogTimer?: ReturnType<typeof setInterval>;
+    lastError?: string;
+    lastReport?: string;
+    unsubscribe: () => void;
 };
 
 type StoredSession = {
-	id: string;
-	path: string;
-	name?: string;
-	cwd: string;
-	modified: Date;
-	messageCount: number;
+    id: string;
+    path: string;
+    name?: string;
+    cwd: string;
+    parentSessionId?: string;
+    modified: Date;
+    messageCount: number;
+    usage: UsageTotals;
 };
 
 type Report = {
@@ -116,11 +123,12 @@ const THINKING_LEVELS = StringEnum(["off", "minimal", "low", "medium", "high", "
 
 const SubagentParams = Type.Object({
 	action: ACTIONS,
-	id: Type.Optional(Type.String({ description: "Subagent ID; omit for start or status-all" })),
+	id: Type.Optional(Type.String({ description: "Existing session ID only; omit for a new start. Never use a task, issue, or display name as id." })),
 	task: Type.Optional(Type.String({ description: "Initial task, or queued instruction when starting/resuming" })),
 	message: Type.Optional(Type.String({ description: "Concise queued instruction for the subagent" })),
 	name: Type.Optional(Type.String({ description: "Short display name for a new subagent" })),
 	model: Type.Optional(Type.String({ description: "Optional provider/model override" })),
+	wait: Type.Optional(Type.Boolean({ description: "For start with a task, wait for the next child report before returning; set false for non-final sequential launches" })),
 	thinking: Type.Optional(THINKING_LEVELS),
 });
 
@@ -132,6 +140,7 @@ type SubagentInput = {
 	name?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
+	wait?: boolean;
 };
 
 function now(): number {
@@ -229,31 +238,8 @@ function assistantText(message: any): string {
 		.trim();
 }
 
-function emptyUsage(): UsageTotals {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
-}
-
-function addUsage(target: UsageTotals, usage: any): void {
-	if (!usage) return;
-	target.input += Number(usage.input ?? 0);
-	target.output += Number(usage.output ?? 0);
-	target.cacheRead += Number(usage.cacheRead ?? 0);
-	target.cacheWrite += Number(usage.cacheWrite ?? 0);
-	target.total += Number(usage.totalTokens ?? usage.total ?? 0);
-	target.cost += Number(usage.cost?.total ?? 0);
-}
-
-function usageFromEntries(entries: any[]): UsageTotals {
-	const usage = emptyUsage();
-	for (const entry of entries) {
-		const message = entry?.type === "message" ? entry.message : entry;
-		if (message?.role === "assistant" || message?.role === "toolResult") addUsage(usage, message.usage);
-	}
-	return usage;
-}
-
 function recordUsage(session: AgentSession): UsageTotals {
-	return usageFromEntries(session.messages as any[]);
+	return usageFromEntries(sessionEntries(session));
 }
 
 function modelLabel(model: Model<any> | undefined, thinking: ThinkingLevel): string {
@@ -286,10 +272,8 @@ function isMoreExpensive(
 }
 
 function getModelOverride(ctx: ExtensionContext, specification: string): Model<any> | undefined {
-	const clean = specification.trim();
-	const slash = clean.indexOf("/");
-	if (slash > 0) return ctx.modelRegistry.find(clean.slice(0, slash), clean.slice(slash + 1));
-	return ctx.modelRegistry.getAll().find((model) => model.id === clean);
+	const available = ctx.modelRegistry.getAvailable();
+	return resolveModelReference(available, specification, ctx.model?.provider) as Model<any> | undefined;
 }
 
 
@@ -322,11 +306,14 @@ class SubagentManager {
 	private readonly agents = new Map<string, SubagentRecord>();
 	private readonly approvedExpensive = new Set<string>();
 	private pendingReports: Report[] = [];
+	private readonly reportGate = new ReportGate();
 	private reportTimer?: ReturnType<typeof setTimeout>;
 	private mainBusy = false;
 	private shuttingDown = false;
 	private ui?: ExtensionContext["ui"];
 	private mainCwd?: string;
+    private mainSessionId?: string;
+    private storedSessions: StoredSession[] = [];
 	private oneShotKeepAlive = false;
 	private keepAliveQueued = false;
 	private sendKeepAlive?: () => void;
@@ -335,12 +322,15 @@ class SubagentManager {
 	private summaryQueued = false;
 	private sendSummary?: () => void;
 
-	setMainContext(ctx: ExtensionContext): void {
-		this.ui = ctx.ui;
-		this.mainCwd = ctx.cwd;
-		this.mainContext = ctx;
-		this.refreshWidget();
-	}
+    setMainContext(ctx: ExtensionContext): void {
+        this.ui = ctx.ui;
+        this.mainCwd = ctx.cwd;
+        this.mainSessionId = ctx.sessionManager.getSessionId();
+        this.mainContext = ctx;
+        this.storedSessions = [];
+        void this.loadStoredSessions();
+        this.refreshWidget();
+    }
 
 	setMainBusy(busy: boolean): void {
 		this.mainBusy = busy;
@@ -376,7 +366,7 @@ class SubagentManager {
 	}
 
 	private markCompletionIfReady(): void {
-		if (this.recordsForCwd(this.mainCwd ?? "").length === 0) return;
+        if (this.recordsForContext(this.mainCwd ?? "").length === 0) return;
 		if (this.mainCwd && this.listActive(this.mainCwd).length === 0 && !this.summaryPending && !this.summaryQueued) {
 			this.summaryPending = true;
 		}
@@ -400,34 +390,58 @@ class SubagentManager {
 		return loadConfig();
 	}
 
-	private recordsForCwd(cwd: string): SubagentRecord[] {
-		return [...this.agents.values()].filter((agent) => agent.cwd === cwd);
-	}
+    private recordsForContext(cwd: string, parentSessionId = this.mainSessionId): SubagentRecord[] {
+        return [...this.agents.values()].filter(
+            (agent) => agent.cwd === cwd && (!parentSessionId || agent.parentSessionId === parentSessionId),
+        );
+    }
 
-	private activeCount(cwd: string): number {
-		return this.recordsForCwd(cwd).filter(isActive).length;
-	}
+    private activeCount(cwd: string): number {
+        return this.recordsForContext(cwd).filter(isActive).length;
+    }
 
-	private findActive(id: string | undefined, cwd: string): SubagentRecord | undefined {
-		if (!id) return undefined;
-		const candidates = this.recordsForCwd(cwd).filter((agent) => agent.id === id || agent.shortId === id || agent.id.startsWith(id) || agent.id.endsWith(id));
-		return candidates.length === 1 ? candidates[0] : undefined;
-	}
+    private findActive(id: string | undefined, cwd: string): SubagentRecord | undefined {
+        if (!id) return undefined;
+        const candidates = this.recordsForContext(cwd).filter(
+            (agent) => agent.id === id || agent.shortId === id || agent.id.startsWith(id) || agent.id.endsWith(id),
+        );
+        return candidates.length === 1 ? candidates[0] : undefined;
+    }
 
-	private async resolveStoredSession(id: string, cwd: string): Promise<StoredSession | undefined> {
-		const sessions = await SessionManager.list(cwd, sessionDirectory(cwd));
-		const matching = sessions.filter((session) => session.id === id || session.id.startsWith(id));
-		if (matching.length !== 1) return undefined;
-		const session = matching[0];
-		return {
-			id: session.id,
-			path: session.path,
-			name: session.name,
-			cwd: session.cwd || cwd,
-			modified: session.modified,
-			messageCount: session.messageCount,
-		};
-	}
+    private async readStoredSession(session: Awaited<ReturnType<typeof SessionManager.list>>[number], cwd: string): Promise<StoredSession> {
+        const manager = SessionManager.open(session.path);
+        const entries = manager.getEntries();
+        return {
+            id: session.id,
+            path: session.path,
+            name: session.name,
+            cwd: session.cwd || cwd,
+            parentSessionId: parentSessionIdFromEntries(entries),
+            modified: session.modified,
+            messageCount: session.messageCount,
+            usage: usageFromEntries(entries),
+        };
+    }
+
+    private async loadStoredSessions(): Promise<void> {
+        if (!this.mainCwd || !this.mainSessionId) return;
+        const cwd = this.mainCwd;
+        const parentSessionId = this.mainSessionId;
+        const sessions = await SessionManager.list(cwd, sessionDirectory(cwd));
+        const stored = (await Promise.all(sessions.map((session) => this.readStoredSession(session, cwd))))
+            .filter((session) => session.parentSessionId === parentSessionId);
+        if (this.mainCwd === cwd && this.mainSessionId === parentSessionId) {
+            this.storedSessions = stored;
+            this.refreshWidget();
+        }
+    }
+
+    private async resolveStoredSession(id: string, cwd: string): Promise<StoredSession | undefined> {
+        const sessions = await SessionManager.list(cwd, sessionDirectory(cwd));
+        const matching = sessions.filter((session) => session.id === id || session.id.startsWith(id));
+        if (matching.length !== 1) return undefined;
+        return this.readStoredSession(matching[0], cwd);
+    }
 
 	private async resolveModelAndThinking(
 		ctx: ExtensionContext,
@@ -435,7 +449,7 @@ class SubagentManager {
 		requestedThinking: ThinkingLevel | undefined,
 	): Promise<{ model: Model<any> | undefined; thinking: ThinkingLevel }> {
 		const model = requestedModel ? getModelOverride(ctx, requestedModel) : ctx.model;
-		if (requestedModel && !model) throw new Error(`Unknown model: ${requestedModel}`);
+		if (requestedModel && !model) throw new Error(`No available model: ${requestedModel}. Authenticate its provider or use an available provider/model.`);
 		const thinking = requestedThinking ?? (ctx.thinkingLevel as ThinkingLevel | undefined) ?? "medium";
 		const currentThinking = (ctx.thinkingLevel as ThinkingLevel | undefined) ?? "medium";
 		const changed = requestedModel !== undefined || requestedThinking !== undefined;
@@ -467,44 +481,49 @@ class SubagentManager {
 			throw new Error(`Maximum active subagents reached (${config.maxActive}). Stop one before starting another.`);
 		}
 		const selected = await this.resolveModelAndThinking(ctx, params.model, params.thinking);
-		const manager = stored
-			? SessionManager.open(stored.path, sessionDirectory(ctx.cwd), ctx.cwd)
-			: SessionManager.create(ctx.cwd, sessionDirectory(ctx.cwd));
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: ctx.cwd,
-			agentDir: getAgentDir(),
-			noExtensions: true,
-			appendSystemPrompt: [CHILD_INSTRUCTIONS],
-		});
-		await resourceLoader.reload();
-		const modelRuntime = await ModelRuntime.create({
-			authPath: path.join(getAgentDir(), "auth.json"),
-			modelsPath: path.join(getAgentDir(), "models.json"),
-			refreshOnCreate: false,
-		});
-		const { session } = await createAgentSession({
-			cwd: ctx.cwd,
-			agentDir: getAgentDir(),
-			model: selected.model,
-			thinkingLevel: selected.thinking,
-			tools: config.childTools,
-			resourceLoader,
-			sessionManager: manager,
-			settingsManager: SettingsManager.create(ctx.cwd, getAgentDir()),
-			modelRuntime,
-		});
-		const fullId = session.sessionId;
-		const name = params.name?.trim() || stored?.name || `agent-${fullId.slice(0, 6)}`;
-		if (!stored && name) manager.appendSessionInfo(name);
-		if (stored && params.name?.trim()) manager.appendSessionInfo(params.name.trim());
-		const record: SubagentRecord = {
-			id: fullId,
-			shortId: fullId.slice(-8),
-			name,
-			task: params.task?.trim(),
-			instructionCount: 0,
-			cwd: ctx.cwd,
-			session,
+        const parentSessionId = this.mainSessionId ?? ctx.sessionManager.getSessionId();
+        const manager = stored
+            ? SessionManager.open(stored.path, sessionDirectory(ctx.cwd), ctx.cwd)
+            : SessionManager.create(ctx.cwd, sessionDirectory(ctx.cwd));
+        if (!stored?.parentSessionId) {
+            manager.appendCustomEntry(SUBAGENT_OWNER_CUSTOM_TYPE, { parentSessionId });
+        }
+        const resourceLoader = new DefaultResourceLoader({
+            cwd: ctx.cwd,
+            agentDir: getAgentDir(),
+            noExtensions: true,
+            appendSystemPrompt: [CHILD_INSTRUCTIONS],
+        });
+        await resourceLoader.reload();
+        const modelRuntime = await ModelRuntime.create({
+            authPath: path.join(getAgentDir(), "auth.json"),
+            modelsPath: path.join(getAgentDir(), "models.json"),
+            refreshOnCreate: false,
+        });
+        const { session } = await createAgentSession({
+            cwd: ctx.cwd,
+            agentDir: getAgentDir(),
+            model: selected.model,
+            thinkingLevel: selected.thinking,
+            tools: config.childTools,
+            resourceLoader,
+            sessionManager: manager,
+            settingsManager: SettingsManager.create(ctx.cwd, getAgentDir()),
+            modelRuntime,
+        });
+        const fullId = session.sessionId;
+        const name = params.name?.trim() || stored?.name || `agent-${fullId.slice(0, 6)}`;
+        if (!stored && name) manager.appendSessionInfo(name);
+        if (stored && params.name?.trim()) manager.appendSessionInfo(params.name.trim());
+        const record: SubagentRecord = {
+            id: fullId,
+            shortId: fullId.slice(0, 8),
+            name,
+            task: params.task?.trim(),
+            instructionCount: 0,
+            cwd: ctx.cwd,
+            parentSessionId,
+            session,
 			sessionFile: session.sessionFile ?? manager.getSessionFile() ?? stored?.path ?? "",
 			model: session.model ?? selected.model,
 			thinkingLevel: session.thinkingLevel as ThinkingLevel,
@@ -550,6 +569,7 @@ class SubagentManager {
 		if (event.type === "agent_settled") {
 			this.clearWatchdog(record);
 			if (record.status !== "stopped" && record.status !== "error") record.status = "done";
+			this.reportGate.release();
 			this.markCompletionIfReady();
 			this.refreshWidget();
 			return;
@@ -593,16 +613,21 @@ class SubagentManager {
 		if (this.shuttingDown) return;
 		const config = this.config();
 		this.pendingReports.push({ agent: record, text: truncate(text.trim(), config.maxReportCharacters) });
-		const reportAgentIds = new Set(this.pendingReports.map(({ agent }) => agent.id));
-		for (const active of this.recordsForCwd(record.cwd).filter(isActive)) reportAgentIds.add(active.id);
+        const reportAgentIds = new Set(this.pendingReports.map(({ agent }) => agent.id));
+        for (const active of this.recordsForContext(record.cwd, record.parentSessionId).filter(isActive)) reportAgentIds.add(active.id);
 		this.scheduleReportFlush(reportAgentIds.size > 1 ? config.reportBatchWindowMs : 0);
 		if (this.oneShotKeepAlive) this.requestOneShotKeepAlive();
+	}
+
+	async waitForReport(): Promise<void> {
+		await this.reportGate.wait(this.pendingReports.length > 0 || this.shuttingDown);
 	}
 
 	private scheduleReportFlush(delay: number): void {
 		if (this.reportTimer) return;
 		this.reportTimer = setTimeout(() => {
 			this.reportTimer = undefined;
+			if (this.pendingReports.length > 0) this.reportGate.release();
 			this.flushReports();
 		}, Math.max(0, delay));
 	}
@@ -635,7 +660,7 @@ class SubagentManager {
 		let record = existing;
 		if (!record && params.id) {
 			const stored = await this.resolveStoredSession(params.id, ctx.cwd);
-			if (!stored) throw new Error(`Unknown subagent session: ${params.id}`);
+			if (!stored) throw new Error(`No active or saved subagent matched "${params.id}". To start a new agent, omit id and provide name/task; use id only to resume an existing session.`);
 			record = await this.createSession(ctx, params, stored);
 		}
 		if (!record) record = await this.createSession(ctx, params);
@@ -699,58 +724,59 @@ class SubagentManager {
 	}
 
 	listActive(cwd: string): SubagentRecord[] {
-		return this.recordsForCwd(cwd).filter(isActive);
+        return this.recordsForContext(cwd).filter(isActive);
 	}
 
-	async listStored(cwd: string): Promise<StoredSession[]> {
-		const sessions = await SessionManager.list(cwd, sessionDirectory(cwd));
-		return sessions.map((session) => ({
-			id: session.id,
-			path: session.path,
-			name: session.name,
-			cwd: session.cwd || cwd,
-			modified: session.modified,
-			messageCount: session.messageCount,
-		}));
-	}
+    async listStored(cwd: string, parentSessionId = this.mainSessionId): Promise<StoredSession[]> {
+        const sessions = await SessionManager.list(cwd, sessionDirectory(cwd));
+        const stored = await Promise.all(sessions.map((session) => this.readStoredSession(session, cwd)));
+        return parentSessionId ? stored.filter((session) => session.parentSessionId === parentSessionId) : stored;
+    }
 
-	getRecord(id: string, cwd: string): SubagentRecord | undefined {
-		return this.findActive(id, cwd);
-	}
+    getRecord(id: string, cwd: string): SubagentRecord | undefined {
+        return this.findActive(id, cwd);
+    }
 
-	async resume(ctx: ExtensionContext, stored: StoredSession, message?: string): Promise<SubagentRecord> {
-		const record = await this.createSession(ctx, { action: "start", id: stored.id, task: message }, stored);
-		if (message) await this.queueMessage(record, message);
-		return record;
-	}
+    async resume(ctx: ExtensionContext, stored: StoredSession, message?: string): Promise<SubagentRecord> {
+        const record = await this.createSession(ctx, { action: "start", id: stored.id, task: message }, stored);
+        if (message) await this.queueMessage(record, message);
+        return record;
+    }
 
-	refreshWidget(): void {
-		if (!this.ui || !this.mainCwd) return;
-		const all = this.recordsForCwd(this.mainCwd);
-		const childUsage = emptyUsage();
-		for (const record of all) addUsage(childUsage, recordUsage(record));
-		const mainUsage = this.mainContext ? usageFromEntries(this.mainContext.sessionManager.getEntries() as any[]) : emptyUsage();
-		const combinedCost = mainUsage.cost + childUsage.cost;
-		this.ui.setStatus(
-			"subagents-cost",
-			all.length > 0 ? `children $${childUsage.cost.toFixed(4)} · combined $${combinedCost.toFixed(4)}` : undefined,
-		);
-		const active = all.filter(isActive);
-		if (active.length === 0) {
-			this.ui.setWidget("subagents", undefined);
-			return;
-		}
-		this.ui.setWidget(
-			"subagents",
-			active.map((record) => {
-				const stats = recordStats(record);
-				return `${record.status === "running" ? "●" : "○"} ${record.name} child-turns:${stats.turns} ${modelLabel(record.model, record.thinkingLevel)}  ${formatDuration(stats.elapsedMs)}  $${stats.usage.cost.toFixed(4)} task=${JSON.stringify(preview(record.task, 60))}`;
-			}),
-		);
-	}
+    refreshWidget(): void {
+        if (!this.ui || !this.mainCwd) return;
+        const all = this.recordsForContext(this.mainCwd);
+        const childUsage = emptyUsage();
+        for (const record of all) addUsage(childUsage, recordUsage(record));
+        const activeIds = new Set(all.map((record) => record.id));
+        for (const session of this.storedSessions) {
+            if (!activeIds.has(session.id)) addUsage(childUsage, session.usage);
+        }
+        const mainUsage = this.mainContext ? usageFromEntries(this.mainContext.sessionManager.getEntries()) : emptyUsage();
+        const combinedCost = mainUsage.cost + childUsage.cost;
+        this.ui.setStatus(
+            "subagents-cost",
+            all.length > 0 || this.storedSessions.length > 0
+                ? `children $${childUsage.cost.toFixed(4)} · combined $${combinedCost.toFixed(4)}`
+                : undefined,
+        );
+        const active = all.filter(isActive);
+        if (active.length === 0) {
+            this.ui.setWidget("subagents", undefined);
+            return;
+        }
+        this.ui.setWidget(
+            "subagents",
+            active.map((record) => {
+                const stats = recordStats(record);
+                return `${record.status === "running" ? "●" : "○"} ${record.name} child-turns:${stats.turns} ${modelLabel(record.model, record.thinkingLevel)}  ${formatDuration(stats.elapsedMs)}  $${stats.usage.cost.toFixed(4)} task=${JSON.stringify(preview(record.task, 60))}`;
+            }),
+        );
+    }
 
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
+		this.reportGate.release();
 		if (this.reportTimer) clearTimeout(this.reportTimer);
 		for (const record of this.agents.values()) {
 			this.clearWatchdog(record);
@@ -772,8 +798,9 @@ class SubagentManager {
 
 function recordStats(record: SubagentRecord): { usage: UsageTotals; turns: number; elapsedMs: number } {
 	const usage = recordUsage(record.session);
-	const turns = (record.session.messages as any[]).filter((message) => message.role === "assistant").length;
-	const lastTimestamp = [...(record.session.messages as any[])]
+	const messages = entryArray(record.session.messages);
+	const turns = messages.filter((message) => message.role === "assistant").length;
+	const lastTimestamp = [...messages]
 		.reverse()
 		.find((message) => typeof message.timestamp === "number")?.timestamp;
 	const end = record.status === "running" ? now() : Number(lastTimestamp ?? now());
@@ -781,14 +808,14 @@ function recordStats(record: SubagentRecord): { usage: UsageTotals; turns: numbe
 }
 
 function recordTranscript(record: SubagentRecord): string[] {
-	const entries = record.session.sessionManager.getEntries() as any[];
+	const entries = sessionEntries(record.session);
 	return entries.flatMap((entry) => messageForEntry(entry));
 }
 
 function storedTranscript(stored: StoredSession): string[] {
 	try {
 		const manager = SessionManager.open(stored.path);
-		return manager.getEntries().flatMap((entry: any) => messageForEntry(entry));
+		return entryArray(manager.getEntries()).flatMap((entry: any) => messageForEntry(entry));
 	} catch (error) {
 		return [`Unable to open session: ${error instanceof Error ? error.message : String(error)}`];
 	}
@@ -835,13 +862,14 @@ async function showTranscript(ctx: ExtensionContext, title: string, linesSource:
 
 function renderSubagentCall(args: any, theme: any): Text {
 	const action = String(args?.action ?? "?");
-	const target = args?.id ? ` ${String(args.id).slice(-8)}` : "";
-	let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", `${action}${target}`);
-	if (action === "start" && args?.name) text += ` ${theme.fg("muted", String(args.name))}`;
+    const target = args?.id ? ` id=${String(args.id).slice(0, 8)}` : "";
+	const name = action === "start" && args?.name ? ` name=${String(args.name)}` : "";
+	let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", `${action}${target}${name}`);
 	const instruction = args?.task ?? args?.message;
 	if (instruction) text += `\n  ${theme.fg("dim", preview(String(instruction), 180))}`;
 	if (args?.model) text += `\n  ${theme.fg("muted", `model: ${args.model}`)}`;
 	if (args?.thinking) text += ` ${theme.fg("muted", `thinking: ${args.thinking}`)}`;
+	if (args?.wait === false) text += ` ${theme.fg("muted", "wait: false")}`;
 	return new Text(text, 0, 0);
 }
 
@@ -870,11 +898,11 @@ async function openSubagentsUI(ctx: ExtensionContext, manager: SubagentManager):
 		for (const session of stored) {
 			if (activeIds.has(session.id)) continue;
 			items.push({
-				value: `stored:${session.id}`,
-				label: `○ ${session.name || `agent-${session.id.slice(0, 6)}`} (${session.id.slice(0, 8)})`,
-				description: `saved ${session.modified.toLocaleString()} · ${session.messageCount} messages`,
-			});
-		}
+                value: `stored:${session.id}`,
+                label: `○ ${session.name || `agent-${session.id.slice(0, 6)}`} (${session.id.slice(0, 8)})`,
+                description: `saved ${session.modified.toLocaleString()} · ${session.messageCount} messages · $${session.usage.cost.toFixed(4)}`,
+            });
+        }
 		if (items.length === 0) {
 			ctx.ui.notify("No subagent sessions for this project.", "info");
 			return;
@@ -984,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 		pi.sendMessage(
 			{
 				customType: "subagent-summary-request",
-				content: "All subagent work is complete. Review the participant reports above and provide a concise user-facing summary of the work, decisions, commits, validation, and any limitations. Do not call subagent tools unless a genuine follow-up is needed.",
+				content: "All subagent work is complete. Review the participant reports above. When useful, provide a concise user-facing summary; it may cover the work, decisions, commits, validation, and limitations. Do not call subagent tools unless a genuine follow-up is needed.",
 				display: false,
 			},
 			{ deliverAs: "followUp", triggerTurn: true },
@@ -1008,11 +1036,15 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Start, message, inspect, or stop persistent subagents",
 		promptGuidelines: [
 			"Use subagent only when the user explicitly asks for subagents or delegation.",
+			"For a new agent, call action=start without id. Use name for its display name; never put an issue number, task key, or name in id.",
+			"Use id only with message/stop/status for an active session, or with start when resuming a known saved session.",
+			"If a start call reports no matching session, retry once without id rather than inventing or changing session IDs.",
+			"A start call with a task waits for the first child report and hands control back; do not use bash sleep or status polling to wait. Set wait=false only for non-final sequential launches; parallel starts can wait as a batch.",
 			"When subagents are active, use subagent to manage them rather than doing unrelated project work.",
 			"Give subagents concise instructions and ask follow-up questions when their reports are unclear.",
 			"Subagent reports arrive as participant messages; they exclude child thinking and tool activity.",
 		],
-		description: "Manage up to six persistent child agents. Start/resume them, queue instructions, inspect status, or stop them. Child agents cannot use this tool.",
+		description: "Manage up to ten persistent child agents by default. Start/resume them, queue instructions, inspect status, or stop them. Child agents cannot use this tool.",
 		parameters: SubagentParams,
 		renderCall(args, theme) { return renderSubagentCall(args, theme); },
 		renderResult(result, options, theme) { return renderSubagentResult(result, options, theme); },
@@ -1035,12 +1067,11 @@ export default function (pi: ExtensionAPI) {
 					text = await manager.stop(ctx, input.id);
 					break;
 			}
+			const shouldWaitForReport = input.action === "start" && Boolean(input.task?.trim()) && input.wait !== false;
+			if (shouldWaitForReport) await manager.waitForReport();
 			if (ctx.mode === "print" || ctx.mode === "json") manager.requestOneShotKeepAlive();
-			return {
-				content: [{ type: "text", text }],
-				details: { action: input.action },
-				terminate: true,
-			};
+			const result = subagentToolResult(text, input.action);
+			return shouldWaitForReport ? { ...result, terminate: true } : result;
 		},
 	});
 }
