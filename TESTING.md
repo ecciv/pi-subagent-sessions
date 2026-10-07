@@ -20,34 +20,58 @@ The tests cover:
 - assistant, tool-result, compaction, and branch-summary usage accounting
 - malformed or missing session collections
 - subagent tool results not terminating the foreground turn
+- owner-scoped saved ID resolution, compact-ID collisions, and resume settings
+- one-shot event-driven report draining and aggregate report-size limits
+- cancellation and event-driven waits that ignore progress reports until all selected children settle
+
+## Automated Pi TUI integration test
+
+This launches a real Pi TUI in an isolated tmux session, instructs the coordinator to start one subagent that runs a harmless `printf` command, waits for the finished response, captures the visible TUI text and screenshot, and copies both JSONL session files into the run artifacts directory.
+
+Requirements: Pi installed and authenticated, `tmux`, and Node 22+. Run from the repository root:
+
+```sh
+node integration/pi-tui-subagent.mjs
+```
+
+Artifacts are written under `artifacts/pi-subagent-integration/<run-id>/` (ignored by Git): `main-session.jsonl`, `child-session.jsonl`, `assistant-result.txt`, `tui-visible.txt`, `tui-history.txt`, `tui-screen.ansi`, and `screenshot.svg` (plus `screenshot.png` when libcairo is installed). The integration test prints the exact artifact directory. The sessions are copies of the original Pi JSONL files and can be inspected or reopened with Pi.
+
+Override the model/provider with `PI_SUBAGENT_TEST_PROVIDER` and `PI_SUBAGENT_TEST_MODEL`, the output directory with `PI_SUBAGENT_TEST_OUTPUT`, or the timeout with `PI_SUBAGENT_TEST_TIMEOUT_MS`. This makes real model calls and incurs provider cost.
 
 ## Live smoke test
 
-1. Reload the extension in Pi after changing `index.ts` or any imported module. A running Pi process does not automatically use the edited extension.
-2. Start a read-only worker **without an `id`**:
+1. Reload the extension in Pi after changing `index.ts` or any imported module.
+2. Start a read-only worker **without an `id`**, setting `wait:false` so status can be inspected during its run:
 
    ```json
    {
      "action": "start",
      "name": "extension-smoke-test",
      "task": "Inspect the repository and report the test command. Do not modify files, create branches, or use the network.",
-     "thinking": "low"
+     "thinking": "low",
+     "wait": false
    }
    ```
 
-3. Immediately query status:
+3. While it is running, call `{"action":"status"}`. A sufficiently short task might finish before this call; otherwise it should appear as `running`. Avoid shell sleeps and polling.
+4. After the report, call `{"action":"status","id":"<short-id-from-start>"}`; this should show `done`. Status without an ID lists **only running** children. `/subagents` lists saved children after a restart.
+5. Confirm the worker report says that no files or branches were changed. Also exercise a default (`wait` omitted) start: its tool result should not return until that child is finished. Launch with `wait:false`, then call `{"action":"wait"}`; it should wait for active children, return their reports, and let the foreground LLM continue. For saved-result recovery, let a child finish, reload/restart Pi on the same foreground session before its report is delivered, then call `wait` with no ID; it should recover the report from the saved child transcript. Confirm the resulting wait report is not replayed on a second call.
+6. In print/JSON mode, start a worker and check that the final report and foreground summary arrive without repeated hidden wait turns.
+7. After restarting Pi on the **same foreground session**, resume a saved child using the short ID. Verify that its saved model/thinking level is retained. A child ID from another foreground session must be rejected.
+8. With an intentionally unavailable credential (or a mocked failing provider), confirm the coordinator receives a terminal failure report even when the child emits no assistant text.
 
-   ```json
-   {"action":"status"}
-   ```
+For a new worker, omit `id`. Supplying `id` to `start` means resume an existing saved session and may correctly produce `Unknown subagent session` for an unknown ID. For `wait`, omit `id` to wait for all active children or supply one to wait for a specific child.
 
-   It should report the worker as `running`, and the foreground turn should remain available for another tool call.
-   A `start` call that includes a task waits internally for the first child report (or child settlement) and then hands control back. Do not add a bash sleep/poll loop. `status` remains an immediate inspection operation.
-   If launching agents sequentially, use `wait:false` for non-final starts and leave it unset for the final start. If issuing multiple start calls in one assistant turn, they wait for the first report as a batch.
-4. Query status again after the worker reports completion. It should report `done` and no `entries is not iterable` or `getEntries` error should appear.
-5. Confirm the worker report says that no files or branches were changed.
+## TUI smoke check
 
-For a new worker, omit `id`. Supplying `id` to `start` means resume an existing saved session and may correctly produce `Unknown subagent session` for an unknown ID.
+While at least one child is running, open `/subagents` and verify:
+
+- The row shows its task, model, elapsed time, usage, and latest activity; it updates while the overlay remains open.
+- Selection remains on the same session after opening/closing a transcript or returning from an action.
+- Active sessions offer message/stop actions, while saved sessions offer resume; `v`, `m`, `s`, `r`, and `b` shortcuts match the visible actions.
+- The transcript wraps long and multiline content, follows new activity at the bottom, and keeps its scroll position when reading older content.
+- `t` toggles thinking and `o` toggles tool details; arrow, page, home, and end keys scroll correctly.
+- The list and transcript remain usable in a short/narrow terminal.
 
 ## Cost-accounting check
 

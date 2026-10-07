@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { entryArray, parentSessionIdFromEntries, sessionEntries, usageFromEntries } from "../session-data.ts";
+import { entryArray, parentSessionIdFromEntries, sessionEntries, subagentReportIdsFromEntries, usageFromEntries, usageFromSession } from "../session-data.ts";
 
 test("entryArray accepts the normal session-entry array", () => {
 	const entries = [{ id: "one" }, { id: "two" }];
@@ -27,6 +27,33 @@ test("sessionEntries falls back when an agent session lacks a session manager", 
 	assert.deepEqual(sessionEntries({ sessionManager: { getEntries: () => ({ entries: messages }) } }), messages);
 });
 
+
+test("usageFromEntries accepts numeric costs", () => {
+    assert.equal(
+        usageFromEntries([{ role: "assistant", usage: { totalTokens: 5, cost: 0.125 } }]).cost,
+        0.125,
+    );
+});
+
+test("usageFromSession falls back when session entries have no usage", () => {
+    const usage = usageFromSession({
+        sessionManager: { getEntries: () => [{ type: "custom", customType: "subagent-owner" }] },
+        messages: [{ role: "assistant", usage: { totalTokens: 7, cost: { total: 0.25 } } }],
+    });
+    assert.equal(usage.total, 7);
+    assert.equal(usage.cost, 0.25);
+});
+
+test("usageFromSession uses the agent session's aggregate cost totals", () => {
+    const usage = usageFromSession({
+        getSessionStats: () => ({
+            tokens: { input: 10, output: 5, cacheRead: 8, cacheWrite: 2, total: 25 },
+            cost: 0.125,
+        }),
+        sessionManager: { getEntries: () => [] },
+    });
+    assert.deepEqual(usage, { input: 10, output: 5, cacheRead: 8, cacheWrite: 2, total: 25, cost: 0.125 });
+});
 test("parentSessionIdFromEntries reads the latest owner marker", () => {
     assert.equal(
         parentSessionIdFromEntries([
@@ -36,6 +63,17 @@ test("parentSessionIdFromEntries reads the latest owner marker", () => {
         "main-two",
     );
     assert.equal(parentSessionIdFromEntries([{ type: "message", message: { role: "user" } }]), undefined);
+});
+
+
+test("subagent report tracking recognizes delivered reports and wait results", () => {
+	const ids = subagentReportIdsFromEntries([
+		{ type: "custom_message", customType: "subagent-report", details: { agents: ["child-a"] } },
+		{ type: "message", message: { role: "toolResult", toolName: "subagent", details: { action: "wait", reportAgentIds: ["child-b"] } } },
+		{ type: "message", message: { role: "toolResult", toolName: "subagent", details: { action: "status", reportAgentIds: ["ignored"] } } },
+	]);
+
+	assert.deepEqual(ids, new Set(["child-a", "child-b"]));
 });
 
 

@@ -11,3 +11,11 @@ test("subagent tool results do not terminate the foreground turn", () => {
 	});
 	assert.equal("terminate" in result, false);
 });
+
+
+test("subagent wait results record which saved reports were returned", () => {
+	assert.deepEqual(subagentToolResult("Saved review", "wait", ["child-123"]), {
+		content: [{ type: "text", text: "Saved review" }],
+		details: { action: "wait", reportAgentIds: ["child-123"] },
+	});
+});

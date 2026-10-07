@@ -18,22 +18,27 @@ These files are intentionally separate from normal Pi sessions. Child agents rec
 {"action":"status"}
 {"action":"status","id":"<id>"}
 {"action":"stop","id":"<id>"}
+{"action":"wait"}
+{"action":"wait","id":"<id>"}
 {"action":"start","id":"<old-id>","task":"Continue from the saved session"}
 ```
 
-A `start` call with a task waits for the first child report before handing control back, so the coordinator should not use shell sleeps or status polling. Set `"wait": false` for non-final sequential launches; omit it for the final launch. Multiple parallel starts can wait as one batch.
+Use `{"action":"start","id":"<id>","task":"..."}` to resume a saved/completed child and send it new work. `task` is the instruction for `start`; `message` is only for queueing a follow-up to an active child and does not resume a completed session. A `wait` on an already completed child only retrieves its available report—it does not restart the child.
+A `start` call with a task waits until that child fully finishes by default. Use `{"action":"wait"}` to block for one or all active children; it returns their reports to the LLM. An unscoped wait also recovers unreported completed/saved child results belonging to this foreground session, even when other children are still active. If a saved child produced no assistant report, the manager includes a bounded transcript excerpt. A wait call does not end the foreground LLM turn. Set `"wait": false` on start for non-final launches, then call `wait` before continuing with unrelated work or giving a final answer. Do not use shell sleeps or status polling.
 
-Use the tool only when the user explicitly requests delegation. Subagent reports are delivered to the main agent as concise, batched participant messages containing assistant text only. Child thinking, tool calls, and tool results are not delivered to the main agent.
-In print/JSON one-shot mode, the manager keeps the foreground process alive with hidden wait turns while child agents are active. It only allows Pi to exit after all child agents have reached a terminal state and their final reports have been delivered.
+Use the tool only when the user explicitly requests delegation. Subagent reports are delivered to the main agent as batched participant messages containing assistant text only. Child thinking, tool calls, and tool results are not delivered to the main agent. A whole report batch is capped at 40,000 UTF-8 bytes; omitted text remains in the saved child transcript.
+In print/JSON one-shot mode, the foreground waits for child settlement without making repeated LLM calls, then makes one report-triggered turn before exiting.
 
 ## `/subagents`
 
-`/subagents` opens a TUI overlay for active and saved sessions. It supports transcript viewing, queued user messages, stopping active agents, and resuming saved sessions. The default transcript view is compact; the detail view can show the full child session.
+`/subagents` opens a live TUI overlay for active and saved sessions, with task and latest-activity previews, contextual actions, and preserved selection. Active transcripts follow new reports; press `t` to toggle thinking and `o` to expand/collapse tool details.
 
 
-Saved child sessions are associated with the foreground Pi session that created them. The manager shows saved children for the current foreground session, rather than mixing in children from unrelated sessions in the same project. Each session uses the first eight characters of its UUID consistently in the UI.
+Saved child sessions are associated with the foreground Pi session that created them. The manager shows saved children for the current foreground session, rather than mixing in children from unrelated projects or sessions. Compact session IDs use the random UUID suffix so concurrently-created children remain distinguishable.
+Resuming a saved child keeps its recorded model and thinking level unless you request an override. If the saved model is no longer available, resumption fails rather than silently switching models. Saved sessions from another foreground session cannot be resumed through this manager; an ambiguous compact ID must be replaced with its full ID.
 
-Child usage is calculated from persisted session entries, so completed and saved children remain included in the `children` and `combined` footer totals. Saved sessions display their recorded cost in the `/subagents` list.
+Child usage uses Pi's aggregate session stats while a child is loaded and persisted entries for saved sessions, so completed and saved children remain included in the `children` and `combined` footer totals. Small dollar amounts are shown with extra precision instead of rounding down to `$0.0000`. Saved sessions display their recorded cost in the `/subagents` list.
+
 ## Configuration
 
 Defaults can be overridden in `~/.pi/agent/subagents.json`:
@@ -43,6 +48,7 @@ Defaults can be overridden in `~/.pi/agent/subagents.json`:
   "maxActive": 10,
   "progressTimeoutMs": 60000,
   "progressTokenThreshold": 30000,
+  "progressMinTurns": 5,
   "progressRequestCooldownMs": 300000,
   "reportBatchWindowMs": 300,
   "maxReportCharacters": 12000,
@@ -51,11 +57,11 @@ Defaults can be overridden in `~/.pi/agent/subagents.json`:
 }
 ```
 
-A progress request is queued as a steering message when a child turn exceeds the configured time or token threshold. More expensive model/thinking overrides require interactive confirmation unless `allowExpensiveModels` is enabled.
+A progress request is queued as a steering message when a child turn exceeds the configured time or token threshold, but only after `progressMinTurns` child turns since the last report/request (default 5; set to 0 to disable the turn gate); the existing time cooldown still applies across turns. More expensive model/thinking overrides require interactive confirmation unless `allowExpensiveModels` is enabled; concurrent starts requesting the same override share one confirmation.
 
 ## Tests
 
-Run the standalone session-data tests with Node 22+:
+Run the regression tests with Node 22+:
 See [TESTING.md](TESTING.md) for the live Pi smoke-test procedure and cost-accounting checks.
 
 ```sh
