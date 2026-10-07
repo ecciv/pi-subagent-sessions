@@ -57,9 +57,8 @@ function hasTmuxSession() {
 	return result.status === 0;
 }
 
-function capturePane(ansi = false, history = false) {
+function capturePane(history = false) {
 	const args = ["capture-pane", "-p"];
-	if (ansi) args.push("-e");
 	if (history) args.push("-S", "-");
 	args.push("-t", paneTarget);
 	return tmux(args);
@@ -125,16 +124,11 @@ function delay(ms) {
 
 function savePaneCapture() {
 	if (!hasTmuxSession()) return;
-	const ansi = capturePane(true);
-	const visible = capturePane(false);
-	const history = capturePane(false, true);
-	writeFileSync(path.join(artifactDir, "tui-screen.ansi"), ansi);
+	const visible = capturePane();
+	const history = capturePane(true);
 	writeFileSync(path.join(artifactDir, "tui-visible.txt"), visible);
 	writeFileSync(path.join(artifactDir, "tui-history.txt"), history);
-	const render = spawnSync("python3", [path.join(integrationDir, "render-terminal-screenshot.py"), path.join(artifactDir, "tui-screen.ansi"), path.join(artifactDir, "screenshot.svg")], { encoding: "utf8" });
-	if (render.error) throw render.error;
-	if (render.status !== 0) throw new Error(`Screenshot renderer failed: ${render.stderr || render.stdout}`);
-	return { visible, ansi };
+	return { visible };
 }
 
 function writeManifest(data) {
@@ -176,7 +170,7 @@ async function main() {
 		let jobSettled = false;
 		while (Date.now() < deadline) {
 			if (!hasTmuxSession()) throw new Error(`Pi exited before the integration task completed. Last TUI output:\n${lastScreen}`);
-			lastScreen = stripAnsi(capturePane(false));
+			lastScreen = stripAnsi(capturePane());
 			const session = mainSessionInfo();
 			const finalResponsePresent = session?.assistantText.includes(finalMarker) && session.assistantText.includes(expectedOutput);
 			if (finalResponsePresent) {
@@ -229,7 +223,7 @@ async function main() {
 		mainSessionSource: mainSession?.filePath,
 		childSessionId: childSession?.id,
 		childSessionSource: childSession?.filePath,
-		artifacts: ["main-session.jsonl", "child-session.jsonl", "assistant-result.txt", "tui-visible.txt", "tui-history.txt", "tui-screen.ansi", "screenshot.svg", "screenshot.png (when libcairo is available)"],
+		artifacts: ["main-session.jsonl", "child-session.jsonl", "assistant-result.txt", "tui-visible.txt", "tui-history.txt"],
 		error: failure ? String(failure.stack || failure) : undefined,
 	});
 
@@ -241,7 +235,6 @@ async function main() {
 	console.log(`Main session: ${path.join(artifactDir, "main-session.jsonl")}`);
 	console.log(`Child session: ${path.join(artifactDir, "child-session.jsonl")}`);
 	console.log(`TUI text: ${path.join(artifactDir, "tui-visible.txt")}`);
-	console.log(`Screenshot: ${path.join(artifactDir, "screenshot.svg")} (PNG is also written when libcairo is available)`);
 }
 
 main().catch((error) => {

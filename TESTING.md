@@ -26,7 +26,7 @@ The tests cover:
 
 ## Automated Pi TUI integration test
 
-This launches a real Pi TUI in an isolated tmux session, instructs the coordinator to start one subagent that runs a harmless `printf` command, waits for the finished response, captures the visible TUI text and screenshot, and copies both JSONL session files into the run artifacts directory.
+This launches a real Pi TUI in an isolated tmux session, instructs the coordinator to start one subagent that runs a harmless `printf` command, waits for the finished response, captures visible TUI text and history, and copies both JSONL session files into the run artifacts directory.
 
 Requirements: Pi installed and authenticated, `tmux`, and Node 22+. Run from the repository root:
 
@@ -34,7 +34,7 @@ Requirements: Pi installed and authenticated, `tmux`, and Node 22+. Run from the
 node integration/pi-tui-subagent.mjs
 ```
 
-Artifacts are written under `artifacts/pi-subagent-integration/<run-id>/` (ignored by Git): `main-session.jsonl`, `child-session.jsonl`, `assistant-result.txt`, `tui-visible.txt`, `tui-history.txt`, `tui-screen.ansi`, and `screenshot.svg` (plus `screenshot.png` when libcairo is installed). The integration test prints the exact artifact directory. The sessions are copies of the original Pi JSONL files and can be inspected or reopened with Pi.
+Artifacts are written under `artifacts/pi-subagent-integration/<run-id>/` (ignored by Git): `main-session.jsonl`, `child-session.jsonl`, `assistant-result.txt`, `tui-visible.txt`, and `tui-history.txt`. The session files are copies of the original Pi JSONL sessions and can be inspected or reopened with Pi. The integration test prints the exact artifact directory.
 
 Override the model/provider with `PI_SUBAGENT_TEST_PROVIDER` and `PI_SUBAGENT_TEST_MODEL`, the output directory with `PI_SUBAGENT_TEST_OUTPUT`, or the timeout with `PI_SUBAGENT_TEST_TIMEOUT_MS`. This makes real model calls and incurs provider cost.
 
