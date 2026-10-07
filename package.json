@@ -1,0 +1,44 @@
+{
+  "name": "pi-subagent-sessions",
+  "version": "0.1.0",
+  "description": "Manage persistent, resumable child-agent sessions in Pi.",
+  "license": "MIT",
+  "author": "Victor Granlund",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ecciv/pi-subagent-sessions.git"
+  },
+  "homepage": "https://github.com/ecciv/pi-subagent-sessions#readme",
+  "bugs": {
+    "url": "https://github.com/ecciv/pi-subagent-sessions/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagent",
+    "subagents",
+    "coding-agent"
+  ],
+  "files": [
+    "*.ts",
+    "config.json",
+    "README.md",
+    "TESTING.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

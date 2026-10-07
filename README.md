@@ -1,6 +1,14 @@
-# Subagent manager
+# pi-subagent-sessions
 
-This extension adds one LLM tool, `subagent`, and the `/subagents` interactive manager.
+This Pi package adds one LLM tool, `subagent`, and the `/subagents` interactive manager. Child sessions are persistent, scoped to their parent session, and resumable.
+
+## Install
+
+After the package is published, install it with:
+
+```sh
+pi install npm:pi-subagent-sessions
+```
 
 The manager keeps child sessions under:
 
